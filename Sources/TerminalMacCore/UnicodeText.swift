@@ -1,5 +1,30 @@
 /// UTF-16 payloads for literal keyboard events, keeping each Character intact.
 public enum UnicodeText {
+    /// A single literal input step delivered to CoreGraphics.
+    public enum KeyEvent: Equatable {
+        case returnKey
+        case tabKey
+        case unicode([UInt16])
+    }
+
+    /// Splits text into one event per Character so every symbol (including `;`, `|`, `>`, `"`, `'`,
+    /// `$`, backticks, spaces, CJK and emoji) is posted cleanly once without multi-char chunk drops.
+    public static func events(_ text: String) -> [KeyEvent] {
+        var result: [KeyEvent] = []
+        result.reserveCapacity(text.count)
+        for character in text {
+            if character == "\n" || character == "\r" || character == "\r\n" {
+                result.append(.returnKey)
+            } else if character == "\t" {
+                result.append(.tabKey)
+            } else {
+                let units = Array(String(character).utf16)
+                if !units.isEmpty { result.append(.unicode(units)) }
+            }
+        }
+        return result
+    }
+
     public static func chunks(_ text: String) -> [[UInt16]] {
         var result: [[UInt16]] = []
         var chunk: [UInt16] = []

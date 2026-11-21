@@ -50,9 +50,13 @@ final class GuestRuntime: NSObject {
                 do {
                     for request in try mailbox.requests() {
                         lastRequest = Date()
-                        // Live frames long-poll for changes; input must never wait behind them.
-                        if request.arguments["format"] == "bgra-lz4" { Task { await self.handle(request) } }
-                        else { await handle(request) }
+                        // Long-running actions (live frames, shell exec, file transfers) must not block input or status.
+                        let asyncActions: Set<String> = ["exec", "push", "pull", "ssh-setup"]
+                        if request.arguments["format"] == "bgra-lz4" || asyncActions.contains(request.action) {
+                            Task { await self.handle(request) }
+                        } else {
+                            await handle(request)
+                        }
                     }
                 } catch { stderr(error.localizedDescription) }
                 desktop.stopIfIdle()
@@ -145,10 +149,12 @@ final class GuestRuntime: NSObject {
                 let bounds = CGDisplayBounds(CGMainDisplayID())
                 values = ["screenRecording": String(CGPreflightScreenCaptureAccess()), "accessibility": String(AXIsProcessTrusted()),
                           "width": String(Int(bounds.width)), "height": String(Int(bounds.height)),
-                          "version": Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.2.0",
+                          "version": Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.2.1",
                           // Build and pid show which helper answered, so an update or relaunch can be confirmed from the host.
                           "build": Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "",
-                          "bundlePath": Bundle.main.bundlePath, "pid": String(ProcessInfo.processInfo.processIdentifier)]
+                          "bundlePath": Bundle.main.bundlePath, "pid": String(ProcessInfo.processInfo.processIdentifier),
+                          "user": NSUserName(), "ip": GuestNetworkInfo.primaryIPv4() ?? "",
+                          "sshReady": String(SSHProbe.isLocalSSHListening())]
             case "permissions":
                 // A helper signed with a new identity keeps its toggles in System Settings while the grants behind them
                 // are void, so drop the recorded grants and prompt again from this process. macOS 27 adds a second
@@ -225,18 +231,142 @@ final class GuestRuntime: NSObject {
             case "type":
                 try requireAccessibility()
                 guard let text = request.arguments["text"], text.utf8.count <= 32768 else { throw Failure("Provide text (maximum 32 KiB)") }
-                // Unicode events avoid modifying the guest or host clipboard.
-                for chunk in UnicodeText.chunks(text) {
-                    guard let down = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: true),
-                          let up = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: false) else { throw Failure("Cannot create keyboard event") }
-                    // Literal text must not inherit modifiers from a preceding shortcut.
-                    down.flags = []; up.flags = []
-                    chunk.withUnsafeBufferPointer { ptr in down.keyboardSetUnicodeString(stringLength: ptr.count, unicodeString: ptr.baseAddress!) }
-                    down.post(tap: .cghidEventTap); up.post(tap: .cghidEventTap)
+                // Use an isolated private event source and post one Character per event with gentle pacing
+                // so modifiers never leak and special characters (; | > " ' $ `) are delivered verbatim once.
+                let source = CGEventSource(stateID: .privateState)
+                let events = UnicodeText.events(text)
+                let paceNs: UInt64 = events.count > 500 ? 1_000_000 : 2_000_000
+                for step in events {
+                    switch step {
+                    case .returnKey:
+                        try postLiteralKey(source: source, virtualKey: 36)
+                    case .tabKey:
+                        try postLiteralKey(source: source, virtualKey: 48)
+                    case .unicode(let units):
+                        guard let down = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: true),
+                              let up = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: false) else {
+                            throw Failure("Cannot create keyboard event")
+                        }
+                        down.flags = []; up.flags = []
+                        units.withUnsafeBufferPointer { ptr in
+                            down.keyboardSetUnicodeString(stringLength: ptr.count, unicodeString: ptr.baseAddress!)
+                        }
+                        down.post(tap: .cghidEventTap)
+                        try? await Task.sleep(nanoseconds: 500_000)
+                        up.post(tap: .cghidEventTap)
+                    }
+                    try? await Task.sleep(nanoseconds: paceNs)
                 }
             case "key":
                 try requireAccessibility()
                 try press(request.arguments["key"] ?? "")
+            case "exec":
+                guard let command = request.arguments["command"], !command.isEmpty else {
+                    throw Failure("Missing command")
+                }
+                var stdinData: Data?
+                if let stdinFile = request.arguments["stdinFile"], !stdinFile.isEmpty {
+                    stdinData = try mailbox.read(stdinFile, limit: 16 * 1024 * 1024)
+                } else if let inlineStdin = request.arguments["stdin"] {
+                    stdinData = Data(inlineStdin.utf8)
+                }
+                let remaining = max(1.0, request.deadline.timeIntervalSinceNow - 0.5)
+                let home = FileManager.default.homeDirectoryForCurrentUser
+                var env = ProcessInfo.processInfo.environment
+                env["HOME"] = home.path
+                let basePath = env["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin"
+                let augmented = ["/opt/homebrew/bin", "/usr/local/bin", "\(home.path)/.local/bin", basePath, "/usr/bin", "/bin", "/usr/sbin", "/sbin"]
+                var seen = Set<String>()
+                env["PATH"] = augmented.flatMap { $0.split(separator: ":").map(String.init) }.filter { seen.insert($0).inserted }.joined(separator: ":")
+                let output = try await Task.detached(priority: .userInitiated) {
+                    try LocalProcessRunner.run(
+                        executable: "/bin/zsh",
+                        arguments: ["-c", command],
+                        stdin: stdinData,
+                        environment: env,
+                        currentDirectory: home,
+                        timeout: remaining
+                    )
+                }.value
+                if output.timedOut {
+                    throw Failure("Guest command timed out after \(Int(remaining.rounded()))s")
+                }
+                let stdoutName = "stdout-\(request.id.uuidString).bin"
+                let stderrName = "stderr-\(request.id.uuidString).bin"
+                try mailbox.write(output.stdout, named: stdoutName)
+                try mailbox.write(output.stderr, named: stderrName)
+                values = ["stdoutFile": stdoutName, "stderrFile": stderrName, "exitCode": String(output.exitCode)]
+            case "push":
+                guard let transferFile = request.arguments["file"], !transferFile.isEmpty,
+                      let rawPath = request.arguments["path"], !rawPath.isEmpty else {
+                    throw Failure("push requires file and path")
+                }
+                guard let data = try mailbox.read(transferFile, limit: 64 * 1024 * 1024) else {
+                    throw Failure("Transfer payload missing: \(transferFile)")
+                }
+                var dest = URL(fileURLWithPath: (rawPath as NSString).expandingTildeInPath)
+                var isDir: ObjCBool = false
+                if FileManager.default.fileExists(atPath: dest.path, isDirectory: &isDir), isDir.boolValue,
+                   let filename = request.arguments["filename"], !filename.isEmpty {
+                    dest = dest.appendingPathComponent(filename)
+                } else {
+                    try FileManager.default.createDirectory(at: dest.deletingLastPathComponent(), withIntermediateDirectories: true)
+                }
+                try data.write(to: dest, options: .atomic)
+                if let modeStr = request.arguments["mode"], let mode = Int(modeStr, radix: 8) {
+                    try? FileManager.default.setAttributes([.posixPermissions: mode], ofItemAtPath: dest.path)
+                }
+                values = ["path": dest.path, "bytes": String(data.count)]
+            case "pull":
+                guard let rawPath = request.arguments["path"], !rawPath.isEmpty else {
+                    throw Failure("pull requires path")
+                }
+                let src = URL(fileURLWithPath: (rawPath as NSString).expandingTildeInPath)
+                var isDir: ObjCBool = false
+                guard FileManager.default.fileExists(atPath: src.path, isDirectory: &isDir), !isDir.boolValue else {
+                    throw Failure("Guest file does not exist or is a directory: \(src.path)")
+                }
+                let attrs = try FileManager.default.attributesOfItem(atPath: src.path)
+                let size = (attrs[.size] as? NSNumber)?.intValue ?? 0
+                guard size <= 64 * 1024 * 1024 else {
+                    throw Failure("Guest file exceeds maximum transfer size (64 MiB): \(src.path)")
+                }
+                let data = try Data(contentsOf: src)
+                let transferFile = "transfer-\(request.id.uuidString).bin"
+                try mailbox.write(data, named: transferFile)
+                values = ["file": transferFile, "path": src.path, "bytes": String(data.count)]
+            case "ssh-setup":
+                var keyInstalled = false
+                if let publicKey = request.arguments["publicKey"]?.trimmingCharacters(in: .whitespacesAndNewlines), !publicKey.isEmpty {
+                    let sshDir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".ssh")
+                    try FileManager.default.createDirectory(at: sshDir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+                    try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: sshDir.path)
+                    let authKeys = sshDir.appendingPathComponent("authorized_keys")
+                    var existing = (try? String(contentsOf: authKeys, encoding: .utf8)) ?? ""
+                    let lines = existing.split(whereSeparator: \.isNewline).map { $0.trimmingCharacters(in: .whitespaces) }
+                    if !lines.contains(publicKey) {
+                        if !existing.isEmpty && !existing.hasSuffix("\n") { existing.append("\n") }
+                        existing.append(publicKey + "\n")
+                        try Data(existing.utf8).write(to: authKeys, options: .atomic)
+                    }
+                    try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: authKeys.path)
+                    keyInstalled = true
+                }
+                var sshReady = SSHProbe.isLocalSSHListening()
+                var note = ""
+                if !sshReady {
+                    // Best-effort attempt to enable Remote Login if the helper already has privileges.
+                    let attempt = try? await Task.detached(priority: .utility) {
+                        try LocalProcessRunner.run(executable: "/usr/sbin/systemsetup", arguments: ["-setremotelogin", "on"], timeout: 4)
+                    }.value
+                    sshReady = SSHProbe.isLocalSSHListening()
+                    if !sshReady {
+                        let detail = attempt.map { String(decoding: $0.stderr, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines) } ?? ""
+                        note = detail.isEmpty ? "Enable Remote Login in System Settings -> General -> Sharing (or use --channel agent)." : detail
+                    }
+                }
+                values = ["user": NSUserName(), "ip": GuestNetworkInfo.primaryIPv4() ?? "", "sshReady": String(sshReady), "keyInstalled": String(keyInstalled)]
+                if !note.isEmpty { values["note"] = note }
             default: throw Failure("Unknown guest action: \(request.action)")
             }
             try mailbox.respond(Reply(id: request.id, values: values))
@@ -261,6 +391,15 @@ final class GuestRuntime: NSObject {
         event.setIntegerValueField(.mouseEventClickState, value: Int64(count))
         event.post(tap: .cghidEventTap)
     }
+    func postLiteralKey(source: CGEventSource?, virtualKey: CGKeyCode) throws {
+        guard let down = CGEvent(keyboardEventSource: source, virtualKey: virtualKey, keyDown: true),
+              let up = CGEvent(keyboardEventSource: source, virtualKey: virtualKey, keyDown: false) else {
+            throw Failure("Cannot create keyboard event")
+        }
+        down.flags = []; up.flags = []
+        down.post(tap: .cghidEventTap)
+        up.post(tap: .cghidEventTap)
+    }
     func press(_ chord: String) throws {
         let parts = chord.lowercased().split(separator: "+").map(String.init)
         guard let key = parts.last, let code = Self.keys[key] else { throw Failure("Unknown key: \(chord). Example: cmd+space, return, ctrl+a") }
@@ -274,8 +413,9 @@ final class GuestRuntime: NSObject {
             default: throw Failure("Unknown modifier: \(modifier)")
             }
         }
+        let source = CGEventSource(stateID: .privateState)
         for down in [true, false] {
-            guard let event = CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: down) else { throw Failure("Cannot create key") }
+            guard let event = CGEvent(keyboardEventSource: source, virtualKey: code, keyDown: down) else { throw Failure("Cannot create key") }
             event.flags = flags; event.post(tap: .cghidEventTap)
         }
     }

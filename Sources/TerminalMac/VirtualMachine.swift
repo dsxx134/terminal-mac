@@ -37,6 +37,9 @@ enum VirtualMachines {
                 network.macAddress = VZMACAddress(string: UserNetwork.guestMACAddress)!
             } else {
                 network.attachment = VZNATNetworkDeviceAttachment()
+                if let savedMAC = machine.macAddress, let mac = VZMACAddress(string: savedMAC) {
+                    network.macAddress = mac
+                }
             }
             config.networkDevices = [network]
         }

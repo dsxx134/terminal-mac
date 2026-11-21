@@ -73,8 +73,11 @@ public final class Mailbox {
                 ptr.withMemoryRebound(to: CChar.self, capacity: Int(NAME_MAX) + 1) { String(cString: $0) }
             }
             guard name.hasPrefix("request-"), name.hasSuffix(".json") else { continue }
-            defer { remove(name) }
-            guard let data = try? read(name, limit: 262144), let request = try? JSONDecoder().decode(Request.self, from: data),
+            // Atomically claim the request before reading so overlapping helpers can never execute it twice.
+            let claimed = ".claim-\(getpid())-\(UUID().uuidString).json"
+            guard renameat(fd, name, fd, claimed) == 0 else { continue }
+            defer { remove(claimed) }
+            guard let data = try? read(claimed, limit: 262144), let request = try? JSONDecoder().decode(Request.self, from: data),
                   name == "request-\(request.id.uuidString).json", request.deadline > Date() else { continue }
             requests.append(request)
             if requests.count == 32 { break }

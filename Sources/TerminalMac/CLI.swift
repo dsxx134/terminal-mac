@@ -92,8 +92,12 @@ final class CLI {
         case "__run":
             let args = try Arguments(tail, flags: ["window"])
             let name = try args.machineName()
-            let machine = try store.load(name)
+            var machine = try store.load(name)
             guard machine.installed else { throw Failure("VM installation is incomplete") }
+            if machine.network && !machine.usesUserNetwork && machine.macAddress == nil {
+                machine.macAddress = VZMACAddress.randomLocallyAdministered().string
+                try? store.save(machine)
+            }
             runtime = try MachineRuntime(machine: machine, directory: store.directory(name), tools: toolsURL, gvproxy: gvproxyURL)
             try await runtime!.start(show: args.flags.contains("window"))
             // Keep the app event loop and runtime alive until guest shutdown.
@@ -127,6 +131,10 @@ final class CLI {
             machine.networkMode = args.flags.contains("user") ? "user" : nil
             try store.save(machine)
             try printJSON(["name": name, "network": machine.networkDescription])
+        case "selftest":
+            _ = try Arguments(tail)
+            let report = try await SelfTestSuite.runAll()
+            try printJSONObject(report)
         case "action": try await action(tail)
         case "mcp":
             let args = try Arguments(tail, flags: ["config"])
@@ -181,18 +189,69 @@ final class CLI {
         try await Mailbox(store.directory(name).appendingPathComponent("host-control")).call(Request(action: action, arguments: arguments, timeout: timeout))
     }
     func action(_ input: [String]) async throws {
-        let args = try Arguments(input, flags: ["double"], options: ["x", "y", "x2", "y2", "dx", "dy", "text", "key", "button", "count", "output", "timeout"])
-        let actions: Set<String> = ["status", "permissions", "screenshot", "snapshot", "click", "move", "drag", "scroll", "type", "key"]
+        let args = try Arguments(
+            input,
+            flags: ["double"],
+            options: ["x", "y", "x2", "y2", "dx", "dy", "text", "key", "button", "count", "output", "timeout", "channel", "ssh-key", "ssh-user", "ssh-host", "stdin"]
+        )
+        let actions: Set<String> = ["status", "permissions", "screenshot", "snapshot", "click", "move", "drag", "scroll", "type", "key", "exec", "push", "pull", "ssh-setup"]
         var positions = args.positionals
         let name: String
         if let first = positions.first, actions.contains(first) { name = "default" }
-        else { guard !positions.isEmpty else { throw Failure("Usage: terminal-mac action [NAME] screenshot|click|type|key|scroll|status") }; name = positions.removeFirst() }
+        else { guard !positions.isEmpty else { throw Failure("Usage: terminal-mac action [NAME] screenshot|click|type|key|scroll|status|exec|push|pull|ssh-setup") }; name = positions.removeFirst() }
         try validateName(name)
         _ = try store.load(name)
         guard !positions.isEmpty, actions.contains(positions[0]) else { throw Failure("Unknown or missing guest action") }
         let verb = positions.removeFirst()
+        let channel = try ExecChannel.parse(args.options["channel"])
+
+        if verb == "exec" {
+            let command = positions.joined(separator: " ")
+            guard !command.isEmpty else { throw Failure("Usage: terminal-mac action [NAME] exec [--timeout 30] [--channel auto|ssh|agent] [--ssh-key PATH] -- <command>") }
+            let timeout = try args.integer("timeout", default: 30, range: 1...600)
+            let stdinData = try readOptionalExecStdin(inline: args.options["stdin"])
+            let result = try await HostGuestTransport.exec(
+                store: store, name: name, command: command, stdin: stdinData, timeout: timeout,
+                channel: channel, sshHost: args.options["ssh-host"], sshUser: args.options["ssh-user"], sshKey: args.options["ssh-key"]
+            )
+            try printJSONObject(result.jsonDictionary())
+            return
+        }
+
+        if verb == "push" {
+            guard positions.count == 2 else { throw Failure("Usage: terminal-mac action [NAME] push <host-path> <guest-path> [--channel auto|ssh|agent]") }
+            let timeout = try args.integer("timeout", default: 60, range: 1...600)
+            let result = try await HostGuestTransport.push(
+                store: store, name: name, localPath: positions[0], remotePath: positions[1], timeout: timeout,
+                channel: channel, sshHost: args.options["ssh-host"], sshUser: args.options["ssh-user"], sshKey: args.options["ssh-key"]
+            )
+            try printJSONObject(result.jsonDictionary())
+            return
+        }
+
+        if verb == "pull" {
+            guard positions.count == 2 else { throw Failure("Usage: terminal-mac action [NAME] pull <guest-path> <host-path> [--channel auto|ssh|agent]") }
+            let timeout = try args.integer("timeout", default: 60, range: 1...600)
+            let result = try await HostGuestTransport.pull(
+                store: store, name: name, remotePath: positions[0], localPath: positions[1], timeout: timeout,
+                channel: channel, sshHost: args.options["ssh-host"], sshUser: args.options["ssh-user"], sshKey: args.options["ssh-key"]
+            )
+            try printJSONObject(result.jsonDictionary())
+            return
+        }
+
+        if verb == "ssh-setup" {
+            guard positions.isEmpty else { throw Failure("Usage: terminal-mac action [NAME] ssh-setup [--ssh-key PATH]") }
+            let timeout = try args.integer("timeout", default: 15, range: 1...120)
+            let values = try await HostGuestTransport.setupSSH(store: store, name: name, keyPath: args.options["ssh-key"], timeout: timeout)
+            try printJSON(values)
+            return
+        }
+
         var parameters = args.options
-        parameters.removeValue(forKey: "output"); parameters.removeValue(forKey: "timeout")
+        for key in ["output", "timeout", "channel", "ssh-key", "ssh-user", "ssh-host", "stdin"] {
+            parameters.removeValue(forKey: key)
+        }
         if verb == "type", !positions.isEmpty { parameters["text"] = positions.joined(separator: " "); positions.removeAll() }
         if verb == "key", positions.count == 1 { parameters["key"] = positions.removeFirst() }
         if ["click", "move"].contains(verb), positions.count == 2 { parameters["x"] = positions.removeFirst(); parameters["y"] = positions.removeFirst() }
@@ -283,6 +342,11 @@ final class CLI {
     action [NAME] type 'text'
     action [NAME] key cmd+space
     action [NAME] scroll --dy -300 [--dx 0 --x 640 --y 400]
+    action [NAME] exec [--timeout 30] [--channel auto|ssh|agent] [--ssh-key PATH] -- 'command'
+    action [NAME] push <host-path> <guest-path> [--channel auto|ssh|agent]
+    action [NAME] pull <guest-path> <host-path> [--channel auto|ssh|agent]
+    action [NAME] ssh-setup [--ssh-key PATH]
+    selftest                    Run built-in unit and transport self-tests
 
     mcp [NAME]                  MCP server (stdio) with computer-use tools for agents:
                                 claude mcp add terminal-mac -- terminal-mac mcp
@@ -305,6 +369,31 @@ let appBundle: Bundle = {
 var appVersion: String { appBundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "dev" }
 
 func printJSON(_ value: [String: String]) throws {
-    let data = try JSONSerialization.data(withJSONObject: value, options: [.prettyPrinted, .sortedKeys])
+    try printJSONObject(value)
+}
+
+func printJSONObject(_ value: [String: Any]) throws {
+    let data = try JSONSerialization.data(withJSONObject: value, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes])
     print(String(decoding: data, as: UTF8.self))
+}
+
+/// Reads optional stdin for `action exec` without ever hanging on an idle parent pipe.
+func readOptionalExecStdin(inline: String?) throws -> Data? {
+    if let inline { return Data(inline.utf8) }
+    guard isatty(STDIN_FILENO) == 0 else { return nil }
+    var info = stat()
+    guard fstat(STDIN_FILENO, &info) == 0 else { return nil }
+    let kind = info.st_mode & S_IFMT
+    if kind == S_IFREG {
+        let data = FileHandle.standardInput.readDataToEndOfFile()
+        return data.isEmpty ? nil : data
+    }
+    if kind == S_IFIFO || kind == S_IFSOCK {
+        var pfd = pollfd(fd: STDIN_FILENO, events: Int16(POLLIN), revents: 0)
+        // Only drain piped stdin if data or EOF is immediately available.
+        guard poll(&pfd, 1, 20) > 0, (pfd.revents & Int16(POLLIN)) != 0 else { return nil }
+        let data = FileHandle.standardInput.readDataToEndOfFile()
+        return data.isEmpty ? nil : data
+    }
+    return nil
 }

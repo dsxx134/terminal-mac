@@ -62,12 +62,17 @@ public struct Machine: Codable {
     /// "user" runs the guest network through the bundled gvproxy (DHCP, DNS and NAT in user space); nil or "nat"
     /// uses macOS NAT, which some VPN and proxy apps in TUN mode leave without working DNS.
     public var networkMode: String?
+    /// Persisted MAC address for NAT networking so the host can match the VM's DHCP lease on bridge100.
+    public var macAddress: String?
+    /// Optional SSH overrides for `exec` / `push` / `pull` when connecting over the VM network.
+    public var sshHost: String?
+    public var sshUser: String?
     public var usesUserNetwork: Bool { network && networkMode == "user" }
     public var networkDescription: String { !network ? "offline" : usesUserNetwork ? "user" : "nat" }
-    public init(name: String, cpu: Int, memoryGiB: Int, diskGiB: Int, width: Int = 1280, height: Int = 800, network: Bool = true, installed: Bool = false, scale: Int? = nil, networkMode: String? = nil) {
+    public init(name: String, cpu: Int, memoryGiB: Int, diskGiB: Int, width: Int = 1280, height: Int = 800, network: Bool = true, installed: Bool = false, scale: Int? = nil, networkMode: String? = nil, macAddress: String? = nil, sshHost: String? = nil, sshUser: String? = nil) {
         self.name = name; self.cpu = cpu; self.memoryGiB = memoryGiB; self.diskGiB = diskGiB
         self.width = width; self.height = height; self.network = network; self.installed = installed; self.scale = scale
-        self.networkMode = networkMode
+        self.networkMode = networkMode; self.macAddress = macAddress; self.sshHost = sshHost; self.sshUser = sshUser
     }
 }
 

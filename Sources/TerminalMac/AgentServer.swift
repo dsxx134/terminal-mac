@@ -43,7 +43,37 @@ final class AgentServer {
         ["name": "key", "description": "Press a key or chord: return, tab, escape, backspace, up, cmd+space, cmd+tab, cmd+c, cmd+shift+... Modifiers: cmd, ctrl, alt, shift.",
          "inputSchema": schema(["key": ["type": "string"], "screenshot": after], required: ["key"])],
         ["name": "status", "description": "Report whether the VM is running and the guest helper has its privacy permissions.",
-         "inputSchema": schema([:]), "annotations": ["readOnlyHint": true]]
+         "inputSchema": schema([:]), "annotations": ["readOnlyHint": true]],
+        ["name": "exec", "description": "Run a shell command inside the virtual Mac without GUI typing or secondary shell escaping. Returns JSON with stdout, stderr, exitCode, and channel (ssh or agent).",
+         "inputSchema": schema([
+            "command": ["type": "string", "description": "Command string passed verbatim to the guest shell."],
+            "stdin": ["type": "string", "description": "Optional UTF-8 stdin payload."],
+            "timeout": ["type": "integer", "minimum": 1, "maximum": 600, "description": "Timeout in seconds (default 30)."],
+            "channel": ["type": "string", "enum": ["auto", "ssh", "agent"], "description": "auto tries SSH first and falls back to VirtioFS guest-agent; agent works offline."],
+            "sshHost": ["type": "string"],
+            "sshUser": ["type": "string"],
+            "sshKey": ["type": "string"]
+         ], required: ["command"])],
+        ["name": "push", "description": "Copy a file from the host into the virtual Mac (binary and Unicode safe).",
+         "inputSchema": schema([
+            "localPath": ["type": "string", "description": "Absolute or ~-prefixed path on the host."],
+            "remotePath": ["type": "string", "description": "Destination path inside the guest."],
+            "timeout": ["type": "integer", "minimum": 1, "maximum": 600],
+            "channel": ["type": "string", "enum": ["auto", "ssh", "agent"]],
+            "sshHost": ["type": "string"],
+            "sshUser": ["type": "string"],
+            "sshKey": ["type": "string"]
+         ], required: ["localPath", "remotePath"])],
+        ["name": "pull", "description": "Copy a file from the virtual Mac onto the host (binary and Unicode safe).",
+         "inputSchema": schema([
+            "remotePath": ["type": "string", "description": "Source path inside the guest."],
+            "localPath": ["type": "string", "description": "Destination path on the host."],
+            "timeout": ["type": "integer", "minimum": 1, "maximum": 600],
+            "channel": ["type": "string", "enum": ["auto", "ssh", "agent"]],
+            "sshHost": ["type": "string"],
+            "sshUser": ["type": "string"],
+            "sshKey": ["type": "string"]
+         ], required: ["remotePath", "localPath"])]
     ]
 
     func run() async throws {
@@ -82,6 +112,16 @@ final class AgentServer {
             }
             return String(value)
         }
+        func optionalInt(_ key: String, default fallback: Int, range: ClosedRange<Int>) throws -> Int {
+            guard let raw = a[key] else { return fallback }
+            guard let number = raw as? NSNumber,
+                  CFGetTypeID(number) != CFBooleanGetTypeID(),
+                  let value = number as? Int,
+                  range.contains(value) else {
+                throw Failure("Expected an integer in \(range) for '\(key)'")
+            }
+            return value
+        }
         func string(_ key: String) throws -> String {
             guard let value = a[key] as? String, !value.isEmpty else { throw Failure("Missing '\(key)'") }
             return value
@@ -107,6 +147,37 @@ final class AgentServer {
             requests = [Request(action: "scroll", arguments: arguments, timeout: 10)]
         case "type": requests = [Request(action: "type", arguments: ["text": try string("text")], timeout: 30)]
         case "key": requests = [Request(action: "key", arguments: ["key": try string("key")], timeout: 10)]
+        case "exec":
+            let command = try string("command")
+            let stdinData = (a["stdin"] as? String).map { Data($0.utf8) }
+            let timeout = try optionalInt("timeout", default: 30, range: 1...600)
+            let channel = try ExecChannel.parse(a["channel"] as? String)
+            let result = try await HostGuestTransport.exec(
+                store: store, name: name, command: command, stdin: stdinData, timeout: timeout, channel: channel,
+                sshHost: a["sshHost"] as? String, sshUser: a["sshUser"] as? String, sshKey: a["sshKey"] as? String
+            )
+            let data = try JSONSerialization.data(withJSONObject: result.jsonDictionary(), options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes])
+            return [["type": "text", "text": String(decoding: data, as: UTF8.self)]]
+        case "push":
+            let timeout = try optionalInt("timeout", default: 60, range: 1...600)
+            let channel = try ExecChannel.parse(a["channel"] as? String)
+            let result = try await HostGuestTransport.push(
+                store: store, name: name, localPath: try string("localPath"), remotePath: try string("remotePath"),
+                timeout: timeout, channel: channel,
+                sshHost: a["sshHost"] as? String, sshUser: a["sshUser"] as? String, sshKey: a["sshKey"] as? String
+            )
+            let data = try JSONSerialization.data(withJSONObject: result.jsonDictionary(), options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes])
+            return [["type": "text", "text": String(decoding: data, as: UTF8.self)]]
+        case "pull":
+            let timeout = try optionalInt("timeout", default: 60, range: 1...600)
+            let channel = try ExecChannel.parse(a["channel"] as? String)
+            let result = try await HostGuestTransport.pull(
+                store: store, name: name, remotePath: try string("remotePath"), localPath: try string("localPath"),
+                timeout: timeout, channel: channel,
+                sshHost: a["sshHost"] as? String, sshUser: a["sshUser"] as? String, sshKey: a["sshKey"] as? String
+            )
+            let data = try JSONSerialization.data(withJSONObject: result.jsonDictionary(), options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes])
+            return [["type": "text", "text": String(decoding: data, as: UTF8.self)]]
         default: throw Failure("Unknown tool: \(tool)")
         }
         for request in requests { _ = try await guest(request) }

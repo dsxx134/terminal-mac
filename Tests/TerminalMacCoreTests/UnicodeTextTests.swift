@@ -64,4 +64,27 @@ final class UnicodeTextTests: XCTestCase {
         let longCharacter = "e" + String(repeating: "\u{0301}", count: 40)
         XCTAssertEqual(UnicodeText.chunks(longCharacter + "\n你好"), [Array(longCharacter.utf16), [10], Array("你好".utf16)])
     }
+
+    func testPerCharacterEventsPreserveShellMetacharsExactlyOnce() {
+        let samples = [
+            "echo 'a;b|c>d\"e'",
+            "echo A; echo B",
+            "ls -la \"/Volumes/My Shared Files/\"",
+            "curl -fsSL https://usemagpie.ai/install.sh | sh",
+            "echo $(id) `uname` $HOME\n中文🚀\tend"
+        ]
+        for sample in samples {
+            let events = UnicodeText.events(sample)
+            XCTAssertEqual(events.count, sample.count, "event count mismatch for \(sample)")
+            var rebuilt = ""
+            for ev in events {
+                switch ev {
+                case .returnKey: rebuilt.append("\n")
+                case .tabKey: rebuilt.append("\t")
+                case .unicode(let units): rebuilt.append(String(utf16CodeUnits: units, count: units.count))
+                }
+            }
+            XCTAssertEqual(rebuilt, sample)
+        }
+    }
 }

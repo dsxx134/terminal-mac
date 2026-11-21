@@ -13,10 +13,10 @@ If tools named `screenshot`, `click`, `type`, `key` and so on from the `terminal
 
 1. `status`: the VM is running and both guest permissions are `true`.
 2. `screenshot`: every x/y you pass to other tools is a pixel in this image (top-left origin).
-3. Act with `click` (`clicks: 2` double-clicks, `button: "right"`), `move`, `drag`, `scroll` (negative `dy` scrolls down), `type` (literal text) or `key` (`return`, `tab`, `escape`, `cmd+space`, `cmd+c`, `cmd+shift+4`…).
+3. Act with `click` (`clicks: 2` double-clicks, `button: "right"`), `move`, `drag`, `scroll` (negative `dy` scrolls down), `type` (literal text), `key` (`return`, `tab`, `escape`, `cmd+space`, `cmd+c`, `cmd+shift+4`…), `exec` (run shell commands verbatim and return `{stdout, stderr, exitCode, channel}`), or `push`/`pull` (copy files between host and guest).
 4. Look again: pass `screenshot: true` to an action, or call `screenshot`, before deciding the next step.
 
-Opening an app: `key cmd+space`, `type "Safari"`, `key return`. Prefer keyboard shortcuts over hunting for small targets.
+Opening an app: `key cmd+space`, `type "Safari"`, `key return`. Prefer `exec` for shell commands and `push`/`pull` for file transfers instead of typing commands into Terminal.
 
 ## Without MCP: the CLI
 
@@ -32,9 +32,13 @@ terminal-mac action NAME drag X Y X2 Y2
 terminal-mac action NAME type 'literal text'
 terminal-mac action NAME key cmd+space
 terminal-mac action NAME scroll --dy -300 --x X --y Y
+terminal-mac action NAME exec [--timeout 30] [--channel auto|ssh|agent] [--ssh-key PATH] -- 'echo hi'
+terminal-mac action NAME push /host/file /guest/file [--channel auto|ssh|agent]
+terminal-mac action NAME pull /guest/file /host/file [--channel auto|ssh|agent]
+terminal-mac action NAME ssh-setup [--ssh-key ~/.ssh/id_ed25519.pub]
 ```
 
-Text is sent as Unicode keyboard events, not through the clipboard. No shell-execution action exists.
+Text is sent as isolated per-character Unicode keyboard events, not through the clipboard. `exec`, `push`, and `pull` prefer SSH over the VM network and automatically fall back to the VirtioFS guest-agent mailbox (use `--channel agent` when the VM is offline).
 
 ## When to stop and ask the user
 
