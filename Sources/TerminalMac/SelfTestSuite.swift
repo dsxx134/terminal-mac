@@ -132,6 +132,103 @@ enum SelfTestSuite {
 
             let timed = try LocalProcessRunner.run(executable: "/bin/zsh", arguments: ["-c", "sleep 10"], timeout: 0.3)
             try check(timed.timedOut, "expected timeout to trigger")
+
+            // Regression (P1-1): background descendant holding stdout/stderr open must NOT block past post-exit drain window.
+            let bgStart = Date()
+            let bg = try LocalProcessRunner.run(executable: "/bin/zsh", arguments: ["-c", "(sleep 3 &); echo started"], timeout: 0.5)
+            let bgElapsed = Date().timeIntervalSince(bgStart)
+            try check(!bg.timedOut, "background descendant test should not time out")
+            try check(bg.exitCode == 0, "background descendant exit != 0: \(bg.exitCode)")
+            try check(String(decoding: bg.stdout, as: UTF8.self) == "started\n", "background descendant stdout mismatch: \(String(decoding: bg.stdout, as: UTF8.self))")
+            try check(bgElapsed < 1.5, "background descendant hung readGroup for \(bgElapsed)s (expected < 1.5s)")
+
+            // Regression (P1-1): process ignoring SIGTERM + child must be killed via process group within bounded time.
+            let trapStart = Date()
+            let trapped = try LocalProcessRunner.run(executable: "/bin/zsh", arguments: ["-c", "trap '' TERM; (sleep 10 &); sleep 10"], timeout: 0.3)
+            let trapElapsed = Date().timeIntervalSince(trapStart)
+            try check(trapped.timedOut, "trapped SIGTERM test should time out")
+            try check(trapElapsed < 2.5, "trapped SIGTERM process group cleanup took \(trapElapsed)s (expected < 2.5s)")
+        }
+
+        try await record("stdin_file_slow_pipe_and_limit") {
+            // Regression (P1-2): slow pipe (>100ms before first byte) must be read completely with `--stdin-file -`.
+            var pipeFDs: [Int32] = [-1, -1]
+            try check(Darwin.pipe(&pipeFDs) == 0, "pipe creation failed")
+            let readFD = pipeFDs[0]
+            let writeFD = pipeFDs[1]
+            defer { Darwin.close(readFD) }
+            let expected = Data("slow-pipe-payload-中文 ; | > \"\n".utf8)
+            DispatchQueue.global(qos: .userInitiated).async {
+                defer { Darwin.close(writeFD) }
+                usleep(150_000) // 150ms > old 20ms poll heuristic
+                expected.withUnsafeBytes { ptr in
+                    _ = Darwin.write(writeFD, ptr.baseAddress, ptr.count)
+                }
+            }
+            let start = Date()
+            let got = try readOptionalExecStdin(inline: nil, filePath: "-", stdinFD: readFD)
+            let elapsed = Date().timeIntervalSince(start)
+            try check(got == expected, "slow pipe stdin mismatch: \(String(describing: got))")
+            try check(elapsed >= 0.1, "expected blocking wait >= 100ms, got \(elapsed)s")
+
+            // Verify `--stdin-file <path>` reads local file and enforces maxBytes limit.
+            let tmpFile = FileManager.default.temporaryDirectory.appendingPathComponent("tm-selftest-stdin-\(UUID().uuidString).bin")
+            defer { try? FileManager.default.removeItem(at: tmpFile) }
+            try expected.write(to: tmpFile)
+            let fromFile = try readOptionalExecStdin(inline: nil, filePath: tmpFile.path)
+            try check(fromFile == expected, "--stdin-file path mismatch")
+
+            var rejectedLimit = false
+            do {
+                _ = try readOptionalExecStdin(inline: nil, filePath: tmpFile.path, maxBytes: 8)
+            } catch {
+                rejectedLimit = error.localizedDescription.contains("exceeds maximum size")
+            }
+            try check(rejectedLimit, "expected maxBytes limit error")
+
+            var rejectedConflict = false
+            do {
+                _ = try readOptionalExecStdin(inline: "a", filePath: "-")
+            } catch {
+                rejectedConflict = error.localizedDescription.contains("--stdin-file")
+            }
+            try check(rejectedConflict, "expected conflict error for --stdin + --stdin-file")
+        }
+
+        try await record("ssh_exit_255_and_guest_paths_and_orphan_prune") {
+            // Regression (P2-1): remote `exit 255` with empty or app stderr is NOT an SSH connection failure.
+            try check(!SSHClient.isConnectionFailure(exitCode: 255, stderr: ""), "empty stderr exit 255 must not be connectionFailed")
+            try check(!SSHClient.isConnectionFailure(exitCode: 255, stderr: "custom script error\n"), "app stderr exit 255 must not be connectionFailed")
+            try check(!SSHClient.isConnectionFailure(exitCode: 1, stderr: "ssh: connect to host"), "exit 1 must not be connectionFailed")
+            try check(SSHClient.isConnectionFailure(exitCode: 255, stderr: "ssh: connect to host 192.168.64.6 port 22: Connection refused\n"), "ssh refused must be connectionFailed")
+            try check(SSHClient.isConnectionFailure(exitCode: 255, stderr: "Permission denied (publickey).\n"), "ssh permission denied must be connectionFailed")
+
+            // Regression (P2-2): relative paths anchor to home directory rather than `/`.
+            let fakeHome = URL(fileURLWithPath: "/Users/guest")
+            try check(GuestPathResolver.resolve("notes/a.txt", home: fakeHome).path == "/Users/guest/notes/a.txt", "relative path must anchor to home")
+            try check(GuestPathResolver.resolve("~/Desktop/a.txt", home: fakeHome).path == "/Users/guest/Desktop/a.txt", "tilde path mismatch")
+            try check(GuestPathResolver.resolve("~", home: fakeHome).path == "/Users/guest", "bare tilde mismatch")
+            try check(GuestPathResolver.resolve("/tmp/abs.txt", home: fakeHome).path == "/tmp/abs.txt", "absolute path mismatch")
+
+            // Regression (P2-3): orphan exchange files older than 10 minutes are pruned while fresh/request files stay.
+            let dir = FileManager.default.temporaryDirectory.appendingPathComponent("tm-selftest-prune-\(UUID().uuidString)")
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: dir) }
+            let box = try Mailbox(dir)
+            for name in ["stdout-old.bin", "stderr-old.bin", "transfer-old.bin", "reply-old.json", "stdout-fresh.bin", "request-keep.json"] {
+                try box.write(Data("x".utf8), named: name)
+            }
+            let oldDate = Date().addingTimeInterval(-700)
+            for name in ["stdout-old.bin", "stderr-old.bin", "transfer-old.bin", "reply-old.json", "request-keep.json"] {
+                try FileManager.default.setAttributes([.modificationDate: oldDate], ofItemAtPath: dir.appendingPathComponent(name).path)
+            }
+            let pruned = box.pruneOrphans(olderThan: 600)
+            try check(pruned == 4, "expected 4 pruned orphan files, got \(pruned)")
+            try check(!FileManager.default.fileExists(atPath: dir.appendingPathComponent("stdout-old.bin").path), "stdout-old.bin should be pruned")
+            try check(!FileManager.default.fileExists(atPath: dir.appendingPathComponent("transfer-old.bin").path), "transfer-old.bin should be pruned")
+            try check(!FileManager.default.fileExists(atPath: dir.appendingPathComponent("reply-old.json").path), "reply-old.json should be pruned")
+            try check(FileManager.default.fileExists(atPath: dir.appendingPathComponent("stdout-fresh.bin").path), "stdout-fresh.bin should be kept")
+            try check(FileManager.default.fileExists(atPath: dir.appendingPathComponent("request-keep.json").path), "request-keep.json should be kept")
         }
 
         try await record("mailbox_exec_and_push_pull_roundtrip_md5") {

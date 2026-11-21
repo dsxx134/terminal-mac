@@ -192,7 +192,7 @@ final class CLI {
         let args = try Arguments(
             input,
             flags: ["double"],
-            options: ["x", "y", "x2", "y2", "dx", "dy", "text", "key", "button", "count", "output", "timeout", "channel", "ssh-key", "ssh-user", "ssh-host", "stdin"]
+            options: ["x", "y", "x2", "y2", "dx", "dy", "text", "key", "button", "count", "output", "timeout", "channel", "ssh-key", "ssh-user", "ssh-host", "stdin", "stdin-file"]
         )
         let actions: Set<String> = ["status", "permissions", "screenshot", "snapshot", "click", "move", "drag", "scroll", "type", "key", "exec", "push", "pull", "ssh-setup"]
         var positions = args.positionals
@@ -207,9 +207,9 @@ final class CLI {
 
         if verb == "exec" {
             let command = positions.joined(separator: " ")
-            guard !command.isEmpty else { throw Failure("Usage: terminal-mac action [NAME] exec [--timeout 30] [--channel auto|ssh|agent] [--ssh-key PATH] -- <command>") }
+            guard !command.isEmpty else { throw Failure("Usage: terminal-mac action [NAME] exec [--timeout 30] [--channel auto|ssh|agent] [--ssh-key PATH] [--stdin TEXT | --stdin-file PATH|-] -- <command>") }
             let timeout = try args.integer("timeout", default: 30, range: 1...600)
-            let stdinData = try readOptionalExecStdin(inline: args.options["stdin"])
+            let stdinData = try readOptionalExecStdin(inline: args.options["stdin"], filePath: args.options["stdin-file"])
             let result = try await HostGuestTransport.exec(
                 store: store, name: name, command: command, stdin: stdinData, timeout: timeout,
                 channel: channel, sshHost: args.options["ssh-host"], sshUser: args.options["ssh-user"], sshKey: args.options["ssh-key"]
@@ -249,7 +249,7 @@ final class CLI {
         }
 
         var parameters = args.options
-        for key in ["output", "timeout", "channel", "ssh-key", "ssh-user", "ssh-host", "stdin"] {
+        for key in ["output", "timeout", "channel", "ssh-key", "ssh-user", "ssh-host", "stdin", "stdin-file"] {
             parameters.removeValue(forKey: key)
         }
         if verb == "type", !positions.isEmpty { parameters["text"] = positions.joined(separator: " "); positions.removeAll() }
@@ -342,7 +342,9 @@ final class CLI {
     action [NAME] type 'text'
     action [NAME] key cmd+space
     action [NAME] scroll --dy -300 [--dx 0 --x 640 --y 400]
-    action [NAME] exec [--timeout 30] [--channel auto|ssh|agent] [--ssh-key PATH] -- 'command'
+    action [NAME] exec [--timeout 30] [--channel auto|ssh|agent] [--ssh-key PATH]
+      [--stdin TEXT | --stdin-file PATH|-] -- 'command'
+                                  Use --stdin-file - to read piped stdin to EOF (max 16 MiB)
     action [NAME] push <host-path> <guest-path> [--channel auto|ssh|agent]
     action [NAME] pull <guest-path> <host-path> [--channel auto|ssh|agent]
     action [NAME] ssh-setup [--ssh-key PATH]
@@ -377,23 +379,7 @@ func printJSONObject(_ value: [String: Any]) throws {
     print(String(decoding: data, as: UTF8.self))
 }
 
-/// Reads optional stdin for `action exec` without ever hanging on an idle parent pipe.
-func readOptionalExecStdin(inline: String?) throws -> Data? {
-    if let inline { return Data(inline.utf8) }
-    guard isatty(STDIN_FILENO) == 0 else { return nil }
-    var info = stat()
-    guard fstat(STDIN_FILENO, &info) == 0 else { return nil }
-    let kind = info.st_mode & S_IFMT
-    if kind == S_IFREG {
-        let data = FileHandle.standardInput.readDataToEndOfFile()
-        return data.isEmpty ? nil : data
-    }
-    if kind == S_IFIFO || kind == S_IFSOCK {
-        var pfd = pollfd(fd: STDIN_FILENO, events: Int16(POLLIN), revents: 0)
-        // Only drain piped stdin if data or EOF is immediately available.
-        guard poll(&pfd, 1, 20) > 0, (pfd.revents & Int16(POLLIN)) != 0 else { return nil }
-        let data = FileHandle.standardInput.readDataToEndOfFile()
-        return data.isEmpty ? nil : data
-    }
-    return nil
+/// Reads optional stdin for `action exec`. Use `--stdin-file -` for slow pipes so reading blocks until EOF (16 MiB cap).
+func readOptionalExecStdin(inline: String?, filePath: String? = nil, stdinFD: Int32 = STDIN_FILENO, maxBytes: Int = ExecStdinReader.defaultMaxBytes) throws -> Data? {
+    try ExecStdinReader.read(inline: inline, filePath: filePath, stdinFD: stdinFD, maxBytes: maxBytes)
 }

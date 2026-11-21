@@ -186,10 +186,10 @@ enum HostGuestTransport {
 
         if let host = target.host, SSHProbe.isSSHReady(host: host, timeout: 1.5) {
             do {
-                let bytes = try await Task.detached(priority: .userInitiated) {
+                let pulled = try await Task.detached(priority: .userInitiated) {
                     try SSHClient.pull(host: host, user: target.user, keyPath: sshKey, remotePath: remotePath, localURL: localURL, timeout: TimeInterval(timeout))
                 }.value
-                return TransferResult(ok: true, channel: "ssh", localPath: localURL.path, remotePath: remotePath, bytes: bytes)
+                return TransferResult(ok: true, channel: "ssh", localPath: pulled.localURL.path, remotePath: remotePath, bytes: pulled.bytes)
             } catch let error as SSHError {
                 if case .timedOut = error { throw error }
                 sshFailureReason = error.localizedDescription

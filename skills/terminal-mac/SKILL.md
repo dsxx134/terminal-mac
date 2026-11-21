@@ -32,13 +32,13 @@ terminal-mac action NAME drag X Y X2 Y2
 terminal-mac action NAME type 'literal text'
 terminal-mac action NAME key cmd+space
 terminal-mac action NAME scroll --dy -300 --x X --y Y
-terminal-mac action NAME exec [--timeout 30] [--channel auto|ssh|agent] [--ssh-key PATH] -- 'echo hi'
+terminal-mac action NAME exec [--timeout 30] [--channel auto|ssh|agent] [--ssh-key PATH] [--stdin TEXT | --stdin-file PATH|-] -- 'echo hi'
 terminal-mac action NAME push /host/file /guest/file [--channel auto|ssh|agent]
 terminal-mac action NAME pull /guest/file /host/file [--channel auto|ssh|agent]
 terminal-mac action NAME ssh-setup [--ssh-key ~/.ssh/id_ed25519.pub]
 ```
 
-Text is sent as isolated per-character Unicode keyboard events, not through the clipboard. `exec`, `push`, and `pull` prefer SSH over the VM network and automatically fall back to the VirtioFS guest-agent mailbox (use `--channel agent` when the VM is offline).
+Text is sent as isolated per-character Unicode keyboard events, not through the clipboard. `exec`, `push`, and `pull` prefer SSH over the VM network and automatically fall back to the VirtioFS guest-agent mailbox (use `--channel agent` when the VM is offline). To pipe stdin from a slow upstream command (such as `curl` or `python3`), pass `--stdin-file -` so `exec` blocks reading stdin until EOF (capped at 16 MiB), or pass `--stdin-file /path/to/file` / `--stdin 'text'`.
 
 ## When to stop and ask the user
 

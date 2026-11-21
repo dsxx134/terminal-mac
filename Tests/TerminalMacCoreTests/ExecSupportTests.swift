@@ -72,6 +72,71 @@ final class ExecSupportTests: XCTestCase {
 
         let timed = try LocalProcessRunner.run(executable: "/bin/zsh", arguments: ["-c", "sleep 10"], timeout: 0.3)
         XCTAssertTrue(timed.timedOut)
+
+        let bgStart = Date()
+        let bg = try LocalProcessRunner.run(executable: "/bin/zsh", arguments: ["-c", "(sleep 3 &); echo started"], timeout: 0.5)
+        let bgElapsed = Date().timeIntervalSince(bgStart)
+        XCTAssertFalse(bg.timedOut)
+        XCTAssertEqual(bg.exitCode, 0)
+        XCTAssertEqual(String(decoding: bg.stdout, as: UTF8.self), "started\n")
+        XCTAssertLessThan(bgElapsed, 1.5)
+
+        let trapStart = Date()
+        let trapped = try LocalProcessRunner.run(executable: "/bin/zsh", arguments: ["-c", "trap '' TERM; (sleep 10 &); sleep 10"], timeout: 0.3)
+        let trapElapsed = Date().timeIntervalSince(trapStart)
+        XCTAssertTrue(trapped.timedOut)
+        XCTAssertLessThan(trapElapsed, 2.5)
+    }
+
+    func testExecStdinReaderSlowPipeAndLimit() throws {
+        var fds: [Int32] = [-1, -1]
+        XCTAssertEqual(Darwin.pipe(&fds), 0)
+        let readFD = fds[0]
+        let writeFD = fds[1]
+        defer { Darwin.close(readFD) }
+        let expected = Data("delayed-pipe-中文\n".utf8)
+        DispatchQueue.global(qos: .userInitiated).async {
+            defer { Darwin.close(writeFD) }
+            usleep(150_000)
+            expected.withUnsafeBytes { ptr in
+                _ = Darwin.write(writeFD, ptr.baseAddress, ptr.count)
+            }
+        }
+        let data = try ExecStdinReader.read(inline: nil, filePath: "-", stdinFD: readFD)
+        XCTAssertEqual(data, expected)
+
+        let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("tm-unit-stdin-\(UUID().uuidString).bin")
+        defer { try? FileManager.default.removeItem(at: tmp) }
+        try expected.write(to: tmp)
+        XCTAssertEqual(try ExecStdinReader.read(inline: nil, filePath: tmp.path), expected)
+        XCTAssertThrowsError(try ExecStdinReader.read(inline: nil, filePath: tmp.path, maxBytes: 4))
+        XCTAssertThrowsError(try ExecStdinReader.read(inline: "x", filePath: "-"))
+    }
+
+    func testSSHConnectionFailureGuestPathsAndOrphanPrune() throws {
+        XCTAssertFalse(SSHClient.isConnectionFailure(exitCode: 255, stderr: ""))
+        XCTAssertFalse(SSHClient.isConnectionFailure(exitCode: 255, stderr: "app failed\n"))
+        XCTAssertTrue(SSHClient.isConnectionFailure(exitCode: 255, stderr: "ssh: connect to host 192.168.64.6 port 22: Connection refused\n"))
+        XCTAssertTrue(SSHClient.isConnectionFailure(exitCode: 255, stderr: "Permission denied (publickey)."))
+
+        let home = URL(fileURLWithPath: "/Users/guest")
+        XCTAssertEqual(GuestPathResolver.resolve("rel/file.txt", home: home).path, "/Users/guest/rel/file.txt")
+        XCTAssertEqual(GuestPathResolver.resolve("~/Desktop/a.txt", home: home).path, "/Users/guest/Desktop/a.txt")
+        XCTAssertEqual(GuestPathResolver.resolve("/tmp/a.txt", home: home).path, "/tmp/a.txt")
+
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("tm-unit-prune-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let box = try Mailbox(dir)
+        for name in ["stdout-a.bin", "stderr-a.bin", "transfer-a.bin", "reply-a.json", "stdout-fresh.bin"] {
+            try box.write(Data("x".utf8), named: name)
+        }
+        let oldDate = Date().addingTimeInterval(-700)
+        for name in ["stdout-a.bin", "stderr-a.bin", "transfer-a.bin", "reply-a.json"] {
+            try FileManager.default.setAttributes([.modificationDate: oldDate], ofItemAtPath: dir.appendingPathComponent(name).path)
+        }
+        XCTAssertEqual(box.pruneOrphans(olderThan: 600), 4)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: dir.appendingPathComponent("stdout-fresh.bin").path))
     }
 
     func testMailboxAtomicClaimPreventsDuplicateDelivery() async throws {

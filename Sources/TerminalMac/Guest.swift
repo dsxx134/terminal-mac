@@ -30,6 +30,7 @@ final class GuestRuntime: NSObject {
 
     let tools: URL
     var lastUpdateCheck = Date.distantPast
+    var lastOrphanCleanup = Date.distantPast
 
     init(exchange: URL) throws {
         try GuestGuard.requireVirtualMac()
@@ -61,6 +62,7 @@ final class GuestRuntime: NSObject {
                 } catch { stderr(error.localizedDescription) }
                 desktop.stopIfIdle()
                 if Date().timeIntervalSince(lastUpdateCheck) > 30 { lastUpdateCheck = Date(); GuestBootstrap.updateFromSharedTools(tools) }
+                if Date().timeIntervalSince(lastOrphanCleanup) > 60 { lastOrphanCleanup = Date(); _ = mailbox.pruneOrphans(olderThan: 600) }
                 // Poll quickly while a viewer or agent is active, and gently when idle.
                 try? await Task.sleep(nanoseconds: Date().timeIntervalSince(lastRequest) < 3 ? 3_000_000 : 40_000_000)
             }
@@ -304,7 +306,7 @@ final class GuestRuntime: NSObject {
                 guard let data = try mailbox.read(transferFile, limit: 64 * 1024 * 1024) else {
                     throw Failure("Transfer payload missing: \(transferFile)")
                 }
-                var dest = URL(fileURLWithPath: (rawPath as NSString).expandingTildeInPath)
+                var dest = GuestPathResolver.resolve(rawPath)
                 var isDir: ObjCBool = false
                 if FileManager.default.fileExists(atPath: dest.path, isDirectory: &isDir), isDir.boolValue,
                    let filename = request.arguments["filename"], !filename.isEmpty {
@@ -321,7 +323,7 @@ final class GuestRuntime: NSObject {
                 guard let rawPath = request.arguments["path"], !rawPath.isEmpty else {
                     throw Failure("pull requires path")
                 }
-                let src = URL(fileURLWithPath: (rawPath as NSString).expandingTildeInPath)
+                let src = GuestPathResolver.resolve(rawPath)
                 var isDir: ObjCBool = false
                 guard FileManager.default.fileExists(atPath: src.path, isDirectory: &isDir), !isDir.boolValue else {
                     throw Failure("Guest file does not exist or is a directory: \(src.path)")

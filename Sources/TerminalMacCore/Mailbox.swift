@@ -62,6 +62,37 @@ public final class Mailbox {
         return data
     }
     public func remove(_ name: String) { if (try? check(name)) != nil { unlinkat(fd, name, 0) } }
+
+    /// Removes orphaned sidecar and reply files older than `age` seconds without following symlinks.
+    @discardableResult
+    public func pruneOrphans(olderThan age: TimeInterval = 600, now: Date = Date()) -> Int {
+        let copy = openat(fd, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+        guard copy >= 0, let directory = fdopendir(copy) else {
+            if copy >= 0 { close(copy) }
+            return 0
+        }
+        defer { closedir(directory) }
+        let cutoff = now.timeIntervalSince1970 - max(0, age)
+        var removed = 0
+        while let entry = readdir(directory) {
+            let name = withUnsafePointer(to: &entry.pointee.d_name) { ptr in
+                ptr.withMemoryRebound(to: CChar.self, capacity: Int(NAME_MAX) + 1) { String(cString: $0) }
+            }
+            let isOrphanCandidate =
+                ((name.hasPrefix("stdout-") || name.hasPrefix("stderr-") || name.hasPrefix("stdin-") || name.hasPrefix("transfer-")) && name.hasSuffix(".bin"))
+                || (name.hasPrefix("reply-") && name.hasSuffix(".json"))
+            guard isOrphanCandidate else { continue }
+            var info = stat()
+            guard fstatat(fd, name, &info, AT_SYMLINK_NOFOLLOW) == 0,
+                  (info.st_mode & S_IFMT) == S_IFREG else { continue }
+            let mtime = Double(info.st_mtimespec.tv_sec) + Double(info.st_mtimespec.tv_nsec) / 1_000_000_000.0
+            if mtime < cutoff {
+                if unlinkat(fd, name, 0) == 0 { removed += 1 }
+            }
+        }
+        return removed
+    }
+
     public func requests() throws -> [Request] {
         // Open a fresh description: dup() would share the directory iteration offset.
         let copy = openat(fd, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC)
